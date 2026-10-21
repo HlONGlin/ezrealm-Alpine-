@@ -34,10 +34,13 @@ add_rule <<'EOF'
 2001:db8::1
 443
 IPv6 test
-2
+
+
 n
 EOF
 grep -F 'remote = "[2001:db8::1]:443"' "$CONFIG_FILE"
+grep -F '[endpoints.network]' "$CONFIG_FILE"
+grep -F 'use_udp = false' "$CONFIG_FILE"
 show_rules | grep -F '1. 0.0.0.0:1443 -> [2001:db8::1]:443'
 cp "$CONFIG_FILE" "$work/original"
 # A restart failure must restore the exact original configuration.
@@ -63,10 +66,14 @@ EOF
 if has_rules; then
     printf 'FAIL: last rule still present\n' >&2; exit 1
 fi
+if grep -F '[endpoints.network]' "$CONFIG_FILE"; then
+    printf 'FAIL: deleted rule network settings still present\n' >&2; exit 1
+fi
 grep -F 'realm stop' "$work/service.calls"
 grep -F 'del realm default' "$work/update.calls"
 # The generated OpenRC script must also pass shell syntax checking.
 REALM_BIN="$work/realm"
 write_init
 sh -n "$INIT_FILE"
+grep -F 'export TOKIO_WORKER_THREADS="${TOKIO_WORKER_THREADS:-1}"' "$INIT_FILE"
 printf 'All rule regression checks passed.\n'

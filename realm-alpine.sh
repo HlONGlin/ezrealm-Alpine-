@@ -3,7 +3,7 @@
 # EZrealm Alpine edition. Requires Alpine Linux and root privileges.
 set -u
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 REALM_DIR="/etc/realm"
 REALM_BIN="$REALM_DIR/realm"
 CONFIG_FILE="$REALM_DIR/config.toml"
@@ -57,6 +57,8 @@ description="Realm proxy service"
 command="$REALM_BIN"
 command_args="-c $CONFIG_FILE"
 command_user="root"
+# One Tokio worker by default for small NAT containers; override in /etc/conf.d/realm.
+export TOKIO_WORKER_THREADS="\${TOKIO_WORKER_THREADS:-1}"
 command_background="yes"
 pidfile="/run/realm.pid"
 output_log="$LOG_FILE"
@@ -107,6 +109,7 @@ use_udp = true
 EOF
     fi
     write_init
+    setup_log_rotation || exit 1
     if has_rules; then
         rc-update add realm default || exit 1
     else
@@ -180,7 +183,8 @@ commit_rules() {
 add_rule() {
     [ -f "$CONFIG_FILE" ] || { warn "请先安装 Realm。"; return; }
     while :; do
-        printf '本地监听端口（q 返回）：'; read -r local_port || return 0
+        info 'NAT 提示：这里填写面板映射的内部目标端口；客户端使用公网 IP 和外部端口。'
+        printf '实例内部监听端口（q 返回）：'; read -r local_port || return 0
         [ "$local_port" = q ] && return 0
         valid_port "$local_port" || { warn "端口必须是 1-65535 的数字。"; continue; }
         printf '目标服务器 IP/域名：'; read -r remote_host || return 0
@@ -188,14 +192,21 @@ add_rule() {
         printf '目标端口：'; read -r remote_port || return 0
         valid_port "$remote_port" || { warn "端口必须是 1-65535 的数字。"; continue; }
         printf '备注（可选）：'; read -r remark || return 0
-        printf '监听模式 [1 双栈 / 2 IPv4 / 3 自定义]（默认 1）：'; read -r mode || return 0
-        mode=${mode:-1}
+        printf '监听模式 [1 双栈 / 2 IPv4 / 3 自定义]（默认 2，适合 IPv4 NAT）：'; read -r mode || return 0
+        mode=${mode:-2}
         case "$mode" in
             1) listen='[::]:'"$local_port" ;;
             2) listen='0.0.0.0:'"$local_port" ;;
             3) printf '完整监听地址：'; read -r listen || return 0
                valid_address "$listen" || { warn '监听地址格式无效。'; continue; } ;;
             *) warn '无效选项。'; continue ;;
+        esac
+        printf '协议 [1 TCP / 2 UDP / 3 TCP+UDP]（默认 1）：'; read -r protocol || return 0
+        case "${protocol:-1}" in
+            1) rule_no_tcp=false; rule_use_udp=false ;;
+            2) rule_no_tcp=true; rule_use_udp=true ;;
+            3) rule_no_tcp=false; rule_use_udp=true ;;
+            *) warn '无效协议选项。'; continue ;;
         esac
         # Escape TOML-sensitive characters in user supplied strings.
         safe_remark=$(printf '%s' "$remark" | sed 's/["\\]/\\&/g')
@@ -207,13 +218,59 @@ add_rule() {
         cp -p "$CONFIG_FILE" "$CONFIG_FILE.tmp" || return 1
         {
             printf '\n[[endpoints]]\n# 备注: %s\nlisten = "%s"\nremote = "%s:%s"\n' "$safe_remark" "$listen" "$safe_host" "$remote_port"
+            printf '[endpoints.network]\nno_tcp = %s\nuse_udp = %s\n' "$rule_no_tcp" "$rule_use_udp"
         } >> "$CONFIG_FILE.tmp"
         commit_rules || return 1
         ok '转发规则已添加。'
+        info "请在面板将所选协议的外部端口映射至实例内部 $listen。"
         log "added rule $listen -> $remote_host:$remote_port"
         printf '继续添加？[y/N]：'; read -r answer || return 0
         [ "$answer" = y ] || [ "$answer" = Y ] || return 0
     done
+}
+
+setup_log_rotation() {
+    if ! command -v logrotate >/dev/null 2>&1; then
+        apk add --no-cache logrotate || return 1
+    fi
+    mkdir -p /etc/logrotate.d || return 1
+    cat > /etc/logrotate.d/ezrealm <<'EOF'
+/var/log/realm-manager.log {
+    daily
+    maxsize 1M
+    rotate 2
+    missingok
+    notifempty
+    copytruncate
+    compress
+}
+EOF
+    rc-update add crond default || return 1
+    rc-service crond status >/dev/null 2>&1 || rc-service crond start
+}
+
+diagnostics() {
+    info '=== NAT / Alpine / LXC 诊断（本机信息） ==='
+    printf '系统：'; uname -srm
+    printf '\n服务状态：\n'; rc-service realm status || true
+    printf '\n开机启动：\n'; rc-update show default 2>/dev/null || true
+    printf '\n内存（MiB）：\n'; free -m || true
+    printf '\n磁盘与 inode：\n'; df -h "$REALM_DIR" /var/log; df -i "$REALM_DIR" /var/log
+    printf '\n地址与路由（容器内地址不代表公网可达）：\n'
+    if command -v ip >/dev/null 2>&1; then
+        ip addr show; ip route show; ip -6 route show
+    fi
+    printf '\n监听端口：\n'
+    if command -v ss >/dev/null 2>&1; then
+        ss -lntup
+    elif command -v netstat >/dev/null 2>&1; then
+        netstat -lntu
+    fi
+    printf '\n转发规则：\n'; show_rules
+    printf '\n最近日志：\n'; tail -n 20 "$LOG_FILE" 2>/dev/null || true
+    info '检查顺序：实例服务监听 → 面板 TCP/UDP 内外端口映射 → 防火墙 → 外部客户端测试。'
+    info 'IPv6 请核对直通/NAT 类型及客户端 IPv6 网络；本机诊断不能验证公网可达性。'
+    info 'LXC 共享宿主机内核，内存不足或进程被终止时，请结合面板资源统计和机主日志排查。'
 }
 
 show_rules() {
@@ -268,6 +325,7 @@ uninstall() {
     fi
     rc-update del realm default >/dev/null 2>&1 || true
     rm -f "$INIT_FILE"
+    rm -f /etc/logrotate.d/ezrealm
     sed -i '/# ezrealm-restart$/d' /etc/crontabs/root 2>/dev/null || true
     rm -rf "$REALM_DIR"
     ok 'Realm 已卸载。配置和二进制文件已删除。'
@@ -280,13 +338,14 @@ menu() {
         printf '%b\n' "${YELLOW}EZrealm Alpine v$VERSION${NC}"
         printf '安装状态：%s\n' "$([ -x "$REALM_BIN" ] && printf '已安装' || printf '未安装')"
         printf '服务状态：'; if rc-service realm status >/dev/null 2>&1; then printf '运行中\n'; else printf '未运行\n'; fi
-        printf '\n1. 安装/更新 Realm\n2. 添加转发规则\n3. 查看转发规则\n4. 删除转发规则\n5. 启动服务\n6. 停止服务\n7. 重启服务\n8. 定时任务管理\n9. 查看日志\n10. 完全卸载\n0. 退出\n选择：'
+        printf '\n1. 安装/更新 Realm\n2. 添加转发规则\n3. 查看转发规则\n4. 删除转发规则\n5. 启动服务\n6. 停止服务\n7. 重启服务\n8. 定时任务管理\n9. 查看日志\n10. 完全卸载\n11. NAT / 资源 / 网络诊断\n0. 退出\n选择：'
         read -r choice || return 0
         case "$choice" in
             1) install_realm ;; 2) add_rule ;; 3) show_rules ;; 4) delete_rule ;;
             5) service_action start ;; 6) service_action stop ;; 7) service_action restart ;;
             8) cron_manage ;; 9) tail -n 20 "$LOG_FILE" 2>/dev/null || true ;;
             10) printf '确认卸载？[y/N]：'; read -r confirm || return 0; [ "$confirm" = y ] && uninstall ;;
+            11) diagnostics ;;
             0) exit 0 ;; *) warn '无效选项。' ;;
         esac
         printf '\n按回车继续...'; read -r _ || return 0
