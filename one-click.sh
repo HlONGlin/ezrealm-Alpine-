@@ -5,12 +5,10 @@ set -eu
 
 REPO_RAW_URL="https://raw.githubusercontent.com/HlONGlin/ezrealm-Alpine-/main"
 SCRIPT_URL="$REPO_RAW_URL/realm-alpine.sh"
-TMP_FILE="$(mktemp -t ezrealm-alpine.XXXXXX)"
 
 cleanup() {
     rm -f "$TMP_FILE"
 }
-trap cleanup EXIT INT TERM
 
 if [ "$(id -u)" -ne 0 ]; then
     printf '%s\n' '错误：请使用 root 权限运行。' >&2
@@ -27,7 +25,12 @@ if ! command -v curl >/dev/null 2>&1; then
     apk add --no-cache curl >/dev/null
 fi
 
+TMP_FILE="$(mktemp -t ezrealm-alpine.XXXXXX)"
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 printf '正在下载 EZrealm Alpine 管理脚本...\n'
-curl -fsSL --retry 3 "$SCRIPT_URL" -o "$TMP_FILE"
+curl -fsSL --connect-timeout 15 --max-time 120 --retry 3 "$SCRIPT_URL" -o "$TMP_FILE"
+/bin/sh -n "$TMP_FILE"
 chmod 700 "$TMP_FILE"
-exec /bin/sh "$TMP_FILE" "$@"
+/bin/sh "$TMP_FILE" "$@"
